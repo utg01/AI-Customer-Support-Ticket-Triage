@@ -3,8 +3,6 @@
 An NLP service that predicts ticket `Type` (`Incident`, `Problem`, `Request`, or `Change`) and `Priority` (`high`, `medium`, or `low`).  
 It auto-routes high-confidence Type predictions and flags low-confidence tickets for human review.
 
-Live demo: <!-- TODO: add Streamlit Cloud URL -->
-
 ## Results at a glance
 
 - **Type (4 classes):** macro-F1 about `0.76-0.77`, compared with a `0.14` majority baseline, on a leakage-controlled split.
@@ -14,7 +12,7 @@ Live demo: <!-- TODO: add Streamlit Cloud URL -->
 
 ## How it works
 
-**Data.** English rows from three source CSVs are combined, missing or repeated ticket text is removed, and subject plus body become one text field. Near-duplicate tickets are grouped before the final split.
+**Data.** English rows from three source CSVs are combined, missing or repeated ticket text is removed, and subject plus body become one text field. After cleaning, there are 25,137 tickets, with 4,596 duplicate bodies removed, split into 20,110 train and 5,027 test rows. Type counts are Incident 10,023, Request 7,253, Problem 5,199, and Change 2,662. Near-duplicate tickets are grouped before the final split.
 
 **Embeddings.** Each ticket is represented with `BAAI/bge-small-en-v1.5`, producing vectors that can be used by the classifiers.
 
@@ -92,8 +90,8 @@ Logistic Regression is deployed because it provides `predict_proba` and performs
 ## Run it
 
 ```bash
-git clone <repository-url>
-cd <repository-directory>
+git clone https://github.com/utg01/AI-Customer-Support-Ticket-Triage.git
+cd AI-Customer-Support-Ticket-Triage
 python -m venv venv
 ```
 
@@ -124,8 +122,10 @@ python -m streamlit run streamlit_app.py
 Start the API:
 
 ```bash
-uvicorn app:app --reload
+python -m uvicorn app:app --reload
 ```
+
+API docs open at http://127.0.0.1:8000/docs.
 
 Send `POST /triage` with:
 
@@ -142,6 +142,14 @@ Example response:
 ## Dataset
 
 The project uses the [Multilingual Customer Support Tickets dataset](https://www.kaggle.com/datasets/tobiasbueck/multilingual-customer-support-tickets) from Kaggle, by `tobiasbueck`. The raw CSVs are not included in this repository; English rows from the dataset files were combined for the experiment.
+
+To re-run the notebooks, download the Kaggle dataset and place these files in a `datasets/` folder:
+
+- `dataset-tickets-multi-lang-4-20k.csv`
+- `dataset-tickets-multi-lang3-4k.csv`
+- `aa_dataset-tickets-multi-lang-5-2-50-version.csv`
+
+Run `data_processing.ipynb` first because it creates the `.npy` embedding files; this takes several minutes on CPU. Then run `LinearSVC_RandomForest.ipynb`.
 
 `scikit-learn` is pinned to `1.9.1` in `requirements.txt`; use the same environment version when loading the `.joblib` files.
 
