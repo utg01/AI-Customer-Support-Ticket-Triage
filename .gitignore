@@ -1,8 +1,9 @@
 venv/
 *.npy
 *.csv
-!datasets/
-!datasets/*.csv
+datasets/
+api_review_log.csv
+low_confidence_log.csv
 NLP_Machine_Learning_Guide.pdf
 __pycache__/
 .ipynb_checkpoints/

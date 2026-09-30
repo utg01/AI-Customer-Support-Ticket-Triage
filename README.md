@@ -1,571 +1,187 @@
 # AI Customer Support Ticket Triage
 
-This project uses natural language processing and machine learning to classify customer-support tickets.
-
-For each ticket, the system predicts:
+An NLP service that predicts ticket `Type` (`Incident`, `Problem`, `Request`, or `Change`) and `Priority` (`high`, `medium`, or `low`).  
+It auto-routes high-confidence Type predictions and flags low-confidence tickets for human review.
 
-- `type`: `Change`, `Incident`, `Problem`, or `Request`
-- `priority`: `high`, `medium`, or `low`
-
-The project also includes a Streamlit app that accepts one ticket or a CSV file and returns predictions, confidence scores, and a human-review flag.
+Live demo: <!-- TODO: add Streamlit Cloud URL -->
 
-## Project Flow
+## Results at a glance
 
-The complete flow is:
+- **Type (4 classes):** macro-F1 about `0.76-0.77`, compared with a `0.14` majority baseline, on a leakage-controlled split.
+- At Type confidence `>= 0.7`, the model auto-routes `47%` of tickets at `93%` accuracy; the rest go to human review.
+- **Priority (3 classes)** is only weakly predictable from text: macro-F1 about `0.41` versus a `0.20` baseline. Review flags therefore use Type confidence only.
+- Evaluation leakage was found and fixed; the evidence is documented below.
 
-```text
-Three CSV datasets
-        |
-        v
-Keep English tickets
-        |
-        v
-Combine the datasets
-        |
-        v
-Remove missing and repeated ticket text
-        |
-        v
-Split data into training and test sets
-        |
-        v
-Convert text into numerical embeddings
-        |
-        v
-Train classification models
-        |
-        v
-Evaluate accuracy, precision, recall, F1, and confusion matrices
-        |
-        v
-Save final models and use them in the Streamlit app
-```
+## How it works
 
-In simple Hinglish: pehle datasets ko clean aur combine kiya, phir ticket text ko numbers mein convert kiya, model ko examples se train kiya, aur end mein naye tickets ka type aur priority predict ki.
+**Data.** English rows from three source CSVs are combined, missing or repeated ticket text is removed, and subject plus body become one text field. Near-duplicate tickets are grouped before the final split.
 
-## Repository Structure
+**Embeddings.** Each ticket is represented with `BAAI/bge-small-en-v1.5`, producing vectors that can be used by the classifiers.
 
-```text
-.
-|-- datasets/
-|   |-- dataset-tickets-multi-lang-4-20k.csv
-|   |-- dataset-tickets-multi-lang3-4k.csv
-|   `-- aa_dataset-tickets-multi-lang-5-2-50-version.csv
-|-- data_processing.ipynb
-|-- LinearSVC_RandomForest.ipynb
-|-- streamlit_app.py
-|-- app.py
-|-- clf_type.joblib
-|-- clf_priority.joblib
-|-- requirements.txt
-|-- create_ml_guide_pdf.py
-`-- NLP_Machine_Learning_Guide.pdf
-```
+**Models.** Logistic Regression, LinearSVC, and RandomForest are compared with a dummy majority-class baseline. The final deployed models use balanced class weights where applicable.
 
-The CSV datasets, NumPy embedding files, logs, and generated PDF are ignored by Git where appropriate. The two `.joblib` model files are kept because the Streamlit app needs them to make predictions without retraining.
+**Split and evaluation.** Near-duplicate groups are kept on one side of a `StratifiedGroupKFold` split. Accuracy and macro-F1 are reported for both Type and Priority.
 
-## What We Did in `data_processing.ipynb`
+**Triage.** The API and Streamlit app embed new text, call the saved classifiers, return the predicted labels and confidences, and set `needs_review` when Type confidence is below `0.7`. Priority confidence is reported separately with `priority_reliable` set at `>= 0.6`, but it never triggers review.
 
-### 1. Loaded the datasets
+## The leakage finding
 
-The notebook reads the three CSV files from the `datasets` folder:
+On a random split, RandomForest Priority macro-F1 was `0.713`, suspiciously high. A similarity check found a median nearest-train similarity of `0.966`; `62.5%` of test rows had a train row with cosine similarity above `0.95`. Plain 1-NN label copying scored Type accuracy `0.894` and Priority accuracy `0.81` without a model.
 
-```python
-df1 = pd.read_csv("datasets/dataset-tickets-multi-lang-4-20k.csv")
-df2 = pd.read_csv("datasets/aa_dataset-tickets-multi-lang-5-2-50-version.csv")
-df3 = pd.read_csv("datasets/dataset-tickets-multi-lang3-4k.csv")
-```
+The fix groups near-duplicates using cosine similarity `> 0.95` and connected components. This produced `13,564` groups, with a largest group of `499`, and the split uses `StratifiedGroupKFold` so each group stays on one side. After the fix, maximum test-to-train similarity was `0.95` and 1-NN Priority accuracy fell to `0.461`.
 
-Each CSV is loaded into a pandas DataFrame. A DataFrame is a table in Python, similar to a spreadsheet.
+### Random split (leaky, for comparison only)
 
-### 2. Kept English rows
+| Model | Type acc | Type macro-F1 | Priority acc | Priority macro-F1 |
+|---|---:|---:|---:|---:|
+| Baseline | 0.399 | 0.143 | 0.412 | 0.194 |
+| Logistic Regression | 0.757 | 0.777 | 0.449 | 0.443 |
+| LinearSVC | 0.783 | 0.784 | 0.478 | 0.457 |
+| RandomForest | 0.861 | 0.853 | 0.724 | 0.713 |
 
-The original datasets contain multiple languages. The project keeps English tickets because the chosen model and experiments were designed for English text:
+`Logistic Regression`, `LinearSVC`, and `RandomForest` use `class_weight="balanced"`.
 
-```python
-df1 = df1[df1["language"] == "en"]
-```
+### Group-aware split (honest, used for final numbers)
 
-The same filtering idea was applied to the other datasets.
-
-### 3. Combined the datasets
-
-The three DataFrames were placed one below the other:
-
-```python
-fdf = pd.concat([df1, df2, df3], ignore_index=True)
-```
-
-`ignore_index=True` creates a fresh row number for the combined DataFrame.
-
-### 4. Checked data quality
-
-The notebook checked:
-
-- Duplicate ticket bodies
-- Missing ticket bodies
-- Whether identical text had different `type` values
-- Whether identical text had different `priority` values
-- Class distributions for `type` and `priority`
-
-These checks matter because duplicates can make a model appear stronger than it really is. If almost the same ticket appears in both training and testing data, the model may look as if it learned a general rule when it actually recognized a very similar example.
-
-### 5. Created one text column
-
-The subject and body were combined:
-
-```python
-fdf["text"] = fdf["subject"].fillna("") + " " + fdf["body"]
-```
-
-Missing subjects are replaced with an empty string. This gives the model one complete text field.
-
-### 6. Removed incomplete and repeated examples
-
-```python
-fdf = fdf.dropna(subset=["body"]).copy()
-fdf = fdf.drop_duplicates(subset="text").reset_index(drop=True)
-```
-
-Rows without a body were removed. Repeated complete text was reduced to one row.
-
-The final machine-learning table contains:
-
-```python
-df = fdf[["text", "type", "priority"]].copy()
-```
-
-The other dataset columns are not needed for this experiment.
-
-### 7. Created the initial train/test split
-
-```python
-train_df, test_df = train_test_split(
-    df,
-    test_size=0.2,
-    stratify=df["type"],
-    random_state=42
-)
-```
-
-The result was:
-
-- Training rows: `20,109`
-- Test rows: `5,028`
-- Total rows: `25,137`
-
-`stratify=df["type"]` tries to keep the same ticket-type proportions in both sets. `random_state=42` makes the split reproducible.
-
-### 8. Created text embeddings
-
-The project used:
-
-```python
-SentenceTransformer("BAAI/bge-small-en-v1.5")
-```
-
-An embedding is a list of numbers representing the meaning of a piece of text. Texts with similar meaning tend to have similar vectors.
-
-The embeddings were saved as NumPy files so they would not need to be generated again every time:
-
-- `X_train.npy`
-- `X_test.npy`
-- `X_train_text_basic.npy`
-- `X_test_text_basic.npy`
-- `X_train_text_stop.npy`
-- `X_test_text_stop.npy`
-
-## What We Did in `LinearSVC_RandomForest.ipynb`
-
-### 1. Reloaded the prepared data and embeddings
-
-The second notebook loads the three datasets, rebuilds the cleaned text table, and loads the saved embedding arrays.
-
-It checks that the number of embedding rows matches the number of DataFrame rows. This is important because the labels must stay in exactly the same order as the embeddings.
-
-### 2. Compared models
-
-The notebook compared:
-
-- Dummy baseline
-- Logistic Regression
-- LinearSVC
-- RandomForest
-
-Each model was tested on both targets:
-
-- Ticket `type`
-- Ticket `priority`
-
-`class_weight="balanced"` was used for several models so that less common classes receive more attention.
-
-### 3. Initial random-split results
-
-The first random split produced these saved results:
-
-| Model | Target | Accuracy | Macro-F1 |
-|---|---|---:|---:|
-| Baseline | Type | 0.399 | 0.143 |
-| Baseline | Priority | 0.424 | 0.198 |
-| Logistic Regression | Type | 0.745 | 0.764 |
-| Logistic Regression | Priority | 0.416 | 0.408 |
-| LinearSVC | Type | 0.774 | 0.773 |
-| LinearSVC | Priority | 0.434 | 0.408 |
-| RandomForest | Type | 0.765 | 0.739 |
-| RandomForest | Priority | 0.469 | 0.393 |
-
-A separate earlier run on the same general random-split setup reported:
-
-- RandomForest type accuracy: `0.861`
-- RandomForest type macro-F1: `0.853`
-- RandomForest priority accuracy: `0.724`
-- RandomForest priority macro-F1: `0.713`
-
-The exact score depends on which split and model run is being viewed, but the important observation is the same: the random split looked much stronger than the stricter grouped evaluation.
-
-## Why the Initial Result Was Suspicious
-
-The initial split randomly divided rows into training and test sets. This is often acceptable when every row is independent. Here, however, many tickets were extremely similar.
-
-The notebook calculated embedding similarities between test tickets and training tickets. The saved output showed:
-
-```text
-similarity percentiles (5,25,50,75,95): [0.857 0.929 0.966 0.985 0.996]
-test rows with sim > 0.95: 0.625
-```
-
-This means:
-
-- The median maximum similarity was about `0.966`.
-- The 95th percentile was about `0.996`.
-- About `62.5%` of test rows had a training row with similarity above `0.95`.
-
-So the guess that the similarity was around `0.96` or `0.97` is confirmed. The notebook contains both `0.966` as the median percentile and the `0.95` threshold analysis.
-
-In simple words: the model was often tested on tickets that looked very similar to tickets it had already seen. Is model ne kuch patterns rat liye the, especially repeated or near-repeated ticket wording. This can make random-split accuracy look artificially high. This is a form of evaluation leakage or over-optimistic evaluation, even if the labels themselves were not directly copied.
-
-## Grouping Similar Embeddings
-
-To reduce this problem, the notebook grouped highly similar embeddings.
-
-The `make_groups()` function:
-
-1. Compares embeddings in chunks so the full similarity matrix does not need to be held in one huge operation.
-2. Finds pairs whose similarity is above a threshold.
-3. Builds a graph where similar tickets are connected.
-4. Uses connected components to turn connected tickets into groups.
-
-At a similarity threshold of `0.95`, the saved output was:
-
-```text
-groups: 13564 | largest group: 499 | singletons: 7766
-```
-
-At thresholds of `0.95` and `0.93`, the output was:
-
-```text
-0.95 | groups: 13564 | largest: 499 | singletons: 7766
-0.93 | groups: 9975  | largest: 1042 | singletons: 5063
-```
-
-A lower threshold creates larger groups because more tickets are considered similar.
-
-### Why grouping helps
-
-Without grouping, one group of near-duplicate tickets can be split like this:
-
-```text
-same ticket family -> training set and test set
-```
-
-That gives the model a very familiar example during testing.
-
-With grouping, the goal is:
-
-```text
-same ticket family -> only one side of the split
-```
-
-This tests whether the model can handle a new ticket family rather than simply recognizing a close copy.
-
-The notebook then used:
-
-```python
-StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
-```
-
-`StratifiedGroupKFold` tries to preserve class proportions while keeping each similarity group on one side of the split.
-
-## Group-Aware Results
-
-The grouped split produced:
-
-- Training rows: `20,110`
-- Test rows: `5,027`
-- Test type proportions:
-  - Incident: `0.399`
-  - Request: `0.289`
-  - Problem: `0.207`
-  - Change: `0.106`
-- Test priority proportions:
-  - medium: `0.424`
-  - high: `0.382`
-  - low: `0.194`
-
-The nearest-neighbour results also dropped:
-
-- Type accuracy: `0.739`
-- Priority accuracy: `0.461`
-
-This is evidence that the original random split was easier because of similar examples crossing the split.
-
-The grouped model comparison was:
-
-| Model | Type Accuracy | Type Macro-F1 | Priority Accuracy | Priority Macro-F1 |
+| Model | Type acc | Type macro-F1 | Priority acc | Priority macro-F1 |
 |---|---:|---:|---:|---:|
 | Baseline | 0.399 | 0.143 | 0.424 | 0.198 |
 | Logistic Regression | 0.745 | 0.764 | 0.416 | 0.408 |
 | LinearSVC | 0.774 | 0.773 | 0.434 | 0.408 |
 | RandomForest | 0.765 | 0.739 | 0.469 | 0.393 |
 
-The RandomForest priority result on the grouped split is only `0.469`, compared with the earlier roughly `0.724` priority accuracy from the easier random split. That large drop is why the earlier result should be treated as over-optimistic rather than as proof that the model generalizes well.
+## Confidence threshold and human review
 
-For ticket type, LinearSVC was strongest on the grouped split. For priority, all models were much weaker, which suggests that priority may require information not present in the ticket text alone or may have noisy labels.
+Type only, Logistic Regression, grouped split:
 
-## Evaluation Metrics
+| Threshold | Auto-handled | Accuracy on auto-handled |
+|---:|---:|---:|
+| 0.0 | 100% | 0.745 |
+| 0.5 | 95% | 0.763 |
+| 0.6 | 67% | 0.841 |
+| 0.7 | 47% | 0.930 |
+| 0.8 | 35% | 0.987 |
 
-### Accuracy
+**Deployed threshold:** `0.7`. Priority confidence is shown with `priority_reliable` when confidence is `>= 0.6`, but it never triggers review: only `11%` of tickets reach `0.6`, at `0.662` accuracy.
 
-Accuracy is:
+## Preprocessing experiment
 
-```text
-correct predictions / all predictions
-```
+Logistic Regression on the grouped split produced these macro-F1 scores:
 
-It is easy to understand, but it can hide poor performance on smaller classes.
+| Preprocessing | Type | Priority |
+|---|---:|---:|
+| Raw text | 0.764 | 0.408 |
+| Lowercase + punctuation removed | 0.765 | 0.404 |
+| Plus stop-words removed | 0.746 | 0.411 |
 
-### Precision
+There is no meaningful gain from preprocessing. Raw text is used because the embedding model handles casing and punctuation, while stop-word removal slightly hurts Type performance.
 
-Precision answers:
+## Limitations
 
-> When the model predicts a class, how often is it correct?
+- `Problem` and `Incident` are the hardest pair. `class_weight="balanced"` raised Problem recall from `0.29` to `0.65` on the random split.
+- Priority is weakly predictable from text alone.
+- Evaluation uses one train/test split with about `5,000` test rows, so differences below about `0.02` are noise.
+- The project supports English only.
+- The dataset contains many near-duplicate tickets.
+- Type labels (`Incident`, `Problem`, `Request`, `Change`) are somewhat subjective.
 
-For one class:
+## Final model
 
-```text
-precision = true positives / (true positives + false positives)
-```
+Logistic Regression is deployed because it provides `predict_proba` and performs within noise of LinearSVC. The saved classifiers are `clf_type.joblib` and `clf_priority.joblib`.
 
-Hinglish: model ne jis class ka naam liya, un predictions mein kitne actually sahi the?
+## Run it
 
-### Recall
-
-Recall answers:
-
-> Of all the real examples of a class, how many did the model find?
-
-```text
-recall = true positives / (true positives + false negatives)
-```
-
-Hinglish: jo tickets actually is class ke the, unmein se model ne kitne pakde?
-
-### F1 score
-
-F1 combines precision and recall:
-
-```text
-F1 = 2 * precision * recall / (precision + recall)
-```
-
-A model cannot receive a high F1 if either precision or recall is very low.
-
-### Macro-F1
-
-Macro-F1 calculates F1 separately for every class, then averages the class scores equally.
-
-This is useful here because a model might perform very well on `Request` but poorly on `Problem`. Macro-F1 prevents the large or easy class from hiding the weak class.
-
-Weighted-F1 gives more weight to classes with more examples. It can therefore look better even when a smaller class performs poorly.
-
-## Confusion Matrices
-
-A confusion matrix compares actual labels with predicted labels.
-
-- Rows represent actual labels.
-- Columns represent predicted labels.
-- The diagonal contains correct predictions.
-- Off-diagonal cells contain mistakes.
-
-For example, if a real `Problem` ticket appears in the `Incident` column, the model predicted `Incident` for that Problem ticket.
-
-The first notebook plotted a confusion matrix for ticket type. The PDF guide generated from this project also includes matrices for the model comparisons. A matrix helps explain *which* classes are being confused instead of only showing one overall score.
-
-To read a class row:
-
-```text
-class recall = correct diagonal cell / total actual examples in that row
-```
-
-To read a class column:
-
-```text
-class precision = correct diagonal cell / total predictions in that column
-```
-
-## Final Model and Triage Function
-
-The second notebook saves final Logistic Regression models:
-
-- `clf_type.joblib`
-- `clf_priority.joblib`
-
-They are loaded by the Streamlit app.
-
-The `triage()` function:
-
-1. Receives ticket text.
-2. Creates embeddings using the same SentenceTransformer model.
-3. Gets class probabilities from both saved classifiers.
-4. Chooses the class with the largest probability.
-5. Stores type and priority confidence.
-6. Marks low type confidence as `needs_review`.
-7. Shows whether priority confidence is reliable.
-
-The current threshold settings are:
-
-```python
-THRESHOLDS = {
-    "type": 0.7,
-    "priority": 0.0
-}
-```
-
-A type confidence below `0.7` triggers review. Priority threshold `0.0` means priority confidence by itself does not trigger the review flag. The app still displays `priority_reliable` using a `0.6` threshold.
-
-In the 100-ticket test sample:
-
-- 100 tickets were checked.
-- 58 tickets were flagged for review.
-- The output displayed predicted labels, actual labels, confidence values, and `needs_review`.
-
-Confidence is not a guarantee. A model can be confidently wrong, so the review queue is important.
-
-## Running Locally
-
-### 1. Open the project folder
-
-```powershell
-cd "C:\Users\utg18\OneDrive\Desktop\NLP Project"
-```
-
-### 2. Create a virtual environment if needed
-
-```powershell
+```bash
+git clone <repository-url>
+cd <repository-directory>
 python -m venv venv
 ```
 
-### 3. Activate the environment
-
-PowerShell:
+Windows PowerShell:
 
 ```powershell
 .\venv\Scripts\Activate.ps1
 ```
 
-Command Prompt:
+macOS/Linux:
 
-```cmd
-venv\Scripts\activate
+```bash
+source venv/bin/activate
 ```
 
-### 4. Install dependencies
+Install dependencies:
 
-```powershell
+```bash
 python -m pip install -r requirements.txt
 ```
 
-If Windows runs Streamlit from a different installation, use the project interpreter explicitly:
+Start Streamlit:
 
-```powershell
-.\venv\Scripts\python.exe -m streamlit run streamlit_app.py
+```bash
+python -m streamlit run streamlit_app.py
 ```
 
-This is safer than calling `streamlit run` directly because it guarantees that Streamlit and `sentence_transformers` come from the same environment.
+Start the API:
 
-### 5. Start the app
-
-```powershell
-.\venv\Scripts\python.exe -m streamlit run streamlit_app.py
+```bash
+uvicorn app:app --reload
 ```
 
-Open the local URL shown by Streamlit, normally:
+Send `POST /triage` with:
+
+```json
+{"text": "Subject: Feature change. Body: Could you please add an export to CSV option in the reports dashboard?"}
+```
+
+Example response:
+
+```json
+{"type": "Change", "type_confidence": 0.922, "priority": "low", "priority_confidence": 0.593, "priority_reliable": false, "needs_review": false}
+```
+
+## Dataset
+
+The project uses the [Multilingual Customer Support Tickets dataset](https://www.kaggle.com/datasets/tobiasbueck/multilingual-customer-support-tickets) from Kaggle, by `tobiasbueck`. The raw CSVs are not included in this repository; English rows from the dataset files were combined for the experiment.
+
+`scikit-learn` is pinned to `1.9.1` in `requirements.txt`; use the same environment version when loading the `.joblib` files.
+
+## Repo layout
 
 ```text
-http://localhost:8501
+.
+|-- app.py
+|-- clf_priority.joblib
+|-- clf_type.joblib
+|-- data_processing.ipynb
+|-- LinearSVC_RandomForest.ipynb
+|-- requirements.txt
+|-- streamlit_app.py
+`-- README.md
 ```
 
-### 6. Use the app
+<details>
+<summary>Learning notes and notebook guide</summary>
 
-The app has four areas:
+### Notebook workflow
 
-1. **Single ticket**: paste a ticket and analyze it.
-2. **Batch CSV**: upload a CSV, choose its text column, and process up to 500 rows.
-3. **Review queue**: inspect tickets marked for human review during the current session.
-4. **Model report**: view saved evaluation results and threshold behavior.
+Run `data_processing.ipynb` to load the source data, keep English rows, combine subject and body, remove incomplete or repeated text, and create embeddings. Run `LinearSVC_RandomForest.ipynb` to compare models, measure similarity, create grouped splits, evaluate the models, and save the final classifiers.
 
-## Running the Notebooks
+### Metric definitions
 
-Open the notebooks in VS Code or Jupyter using the project virtual environment.
+- **Accuracy:** correct predictions divided by all predictions.
+- **Precision:** of the tickets predicted as a class, the share that belongs to that class.
+- **Recall:** of the tickets that belong to a class, the share the model finds.
+- **F1:** the harmonic mean of precision and recall.
+- **Macro-F1:** F1 calculated per class and averaged equally, so smaller classes matter as much as larger ones.
 
-Run `data_processing.ipynb` first when rebuilding the data pipeline. It creates the cleaned data and embeddings.
+### Reading a confusion matrix
 
-Run `LinearSVC_RandomForest.ipynb` after that to:
+Rows are actual labels and columns are predicted labels. The diagonal contains correct predictions. A class's recall is its diagonal value divided by the total of its actual-label row; its precision is the diagonal value divided by the total of its predicted-label column.
 
-- Compare classifiers.
-- Check embedding similarity.
-- Create grouped splits.
-- Evaluate models on the stricter split.
-- Save final classifiers.
-- Test triage confidence behavior.
+### Important code lessons
 
-The embedding step can take time because the language model processes every ticket. Reusing the saved `.npy` files avoids repeating that work unnecessarily.
+- Keep embeddings and labels in the same row order.
+- Use `index=False` when saving tabular outputs unless the index is intentional.
+- Group near-duplicates before evaluation when similar records can cross a random split.
 
-## Important Code Lessons
-
-### Dataset paths
-
-All three dataset paths use the `datasets/` folder. If the notebook is run from another working directory, use absolute paths or change the working directory first.
-
-### Saving filtered data
-
-When filtering a DataFrame, save the filtered variable, not the original variable:
-
-```python
-df1 = df1[df1["language"] == "en"]
-df1.to_csv("datasets/dataset-tickets-multi-lang-4-20k.csv", index=False)
-```
-
-### Avoiding index columns
-
-Always use `index=False` when saving a cleaned DataFrame unless the pandas index is intentionally part of the data:
-
-```python
-df.to_csv("output.csv", index=False)
-```
-
-### Keeping embeddings and labels aligned
-
-The row order of `X_train` must match the row order of `train_df`. If rows are shuffled or filtered after embeddings are created, the labels can be paired with the wrong vectors.
-
-## Main Conclusion
-
-The project successfully builds an end-to-end ticket triage pipeline, but the evaluation shows an important limitation.
-
-The initial random split looked strong, especially for RandomForest. The earlier result of roughly 72% priority accuracy and 86% type accuracy was over-optimistic because many test embeddings were extremely similar to training embeddings. The notebook confirmed a median similarity of about `0.966`, with `62.5%` of test rows having similarity above `0.95`.
-
-After grouping similar embeddings and keeping groups separate between training and testing, performance became more realistic. Type prediction remained useful, especially with LinearSVC, but priority prediction was much harder.
-
-The correct lesson is not that the model learned nothing. The model learned useful patterns, especially for ticket type. The lesson is that evaluation must reflect the real use case. If production tickets are new variations of known ticket families, grouped evaluation is a more honest test than a purely random row split.
-
-In Hinglish: initial split mein model ne similar examples dekh kar achha score diya, lekin grouped split ne test kiya ki model genuinely new ticket families par kaisa perform karta hai. Isliye grouped result ko zyada realistic maanna chahiye.
+</details>
