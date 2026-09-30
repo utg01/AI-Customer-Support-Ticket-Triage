@@ -1,0 +1,6 @@
+venv/
+*.npy
+*.csv
+NLP_Machine_Learning_Guide.pdf
+__pycache__/
+.ipynb_checkpoints/
